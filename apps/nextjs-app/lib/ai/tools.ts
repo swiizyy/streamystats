@@ -32,6 +32,16 @@ import {
   getUsers,
   getUserWatchStats,
 } from "@/lib/db/users";
+import {
+  addItemToWatchlist as addItemToWatchlistDb,
+  createWatchlist as createWatchlistDb,
+  deleteWatchlist as deleteWatchlistDb,
+  getUserOwnWatchlists,
+  getWatchlistWithItems,
+  removeItemFromWatchlist as removeItemFromWatchlistDb,
+  reorderWatchlistItems as reorderWatchlistItemsDb,
+  updateWatchlist as updateWatchlistDb,
+} from "@/lib/db/watchlists";
 
 function formatDuration(seconds: number): string {
   const hours = Math.floor(seconds / 3600);
@@ -257,6 +267,9 @@ const limitTypeSchema = z.object({
     .default("all")
     .describe("Filter by item type"),
 });
+
+const sortOrderSchema = z.enum(["custom", "name", "dateAdded", "releaseDate"]);
+const allowedItemTypeSchema = z.enum(["Movie", "Series", "Episode"]);
 
 export function createChatTools(serverId: number, userId: string) {
   return {
@@ -1129,6 +1142,368 @@ export function createChatTools(serverId: number, userId: string) {
               ? `Found ${ranked.length} semantically similar items for "${query}"`
               : `No items found for "${query}" (embeddings search)`,
           usedEmbeddings: true,
+        };
+      },
+    }),
+
+    getMyWatchlists: tool({
+      description:
+        "List the current user's own watchlists (the only ones they can edit). Use this to resolve a watchlist name mentioned by the user into its numeric ID before creating, updating, deleting, or adding/removing items.",
+      inputSchema: z.object({}),
+      execute: async () => {
+        const lists = await getUserOwnWatchlists({ serverId, userId });
+        return {
+          watchlists: lists.map((w) => ({
+            id: w.id,
+            name: w.name,
+            description: w.description,
+            isPublic: w.isPublic,
+            allowedItemType: w.allowedItemType,
+            defaultSortOrder: w.defaultSortOrder,
+            itemCount: w.itemCount,
+          })),
+          message:
+            lists.length > 0
+              ? `Found ${lists.length} watchlist(s)`
+              : "You have no watchlists yet",
+        };
+      },
+    }),
+
+    getWatchlistContents: tool({
+      description:
+        "Get the metadata and items of one of the user's watchlists. Returns item IDs, which are needed to remove an item. Also use this to answer questions like 'what's in my Sci-Fi list?'.",
+      inputSchema: z.object({
+        watchlistId: z
+          .number()
+          .describe("The numeric watchlist ID (from getMyWatchlists)"),
+      }),
+      execute: async ({ watchlistId }: { watchlistId: number }) => {
+        const list = await getWatchlistWithItems({ watchlistId, userId });
+        if (!list) {
+          return {
+            success: false,
+            message: "Watchlist not found or not accessible",
+          };
+        }
+        return {
+          success: true,
+          watchlist: {
+            id: list.id,
+            name: list.name,
+            description: list.description,
+            isPublic: list.isPublic,
+            allowedItemType: list.allowedItemType,
+            defaultSortOrder: list.defaultSortOrder,
+          },
+          items: list.items.map((wi) => ({
+            ...formatItem(wi.item),
+            watchlistItemPosition: wi.position,
+          })),
+          message: `"${list.name}" has ${list.items.length} item(s)`,
+        };
+      },
+    }),
+
+    createWatchlist: tool({
+      description:
+        "Create a new watchlist owned by the current user. Does not need confirmation. New watchlists cannot be promoted/featured from chat.",
+      inputSchema: z.object({
+        name: z.string().trim().min(1).describe("Watchlist name"),
+        description: z.string().optional().describe("Optional description"),
+        isPublic: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe("Whether other users on the server can see this list"),
+        allowedItemType: allowedItemTypeSchema
+          .optional()
+          .describe("If set, only items of this type can be added"),
+        defaultSortOrder: sortOrderSchema
+          .optional()
+          .default("custom")
+          .describe("Default ordering for items in the list"),
+      }),
+      execute: async ({
+        name,
+        description,
+        isPublic,
+        allowedItemType,
+        defaultSortOrder,
+      }: {
+        name: string;
+        description?: string;
+        isPublic: boolean;
+        allowedItemType?: "Movie" | "Series" | "Episode";
+        defaultSortOrder: "custom" | "name" | "dateAdded" | "releaseDate";
+      }) => {
+        const created = await createWatchlistDb({
+          serverId,
+          userId,
+          name: name.trim(),
+          description: description ?? null,
+          isPublic: isPublic ?? false,
+          allowedItemType: allowedItemType ?? null,
+          defaultSortOrder: defaultSortOrder ?? "custom",
+        });
+        return {
+          success: true,
+          watchlist: {
+            id: created.id,
+            name: created.name,
+            description: created.description,
+            isPublic: created.isPublic,
+            allowedItemType: created.allowedItemType,
+            defaultSortOrder: created.defaultSortOrder,
+          },
+          message: `Created watchlist "${created.name}"`,
+        };
+      },
+    }),
+
+    updateWatchlist: tool({
+      description:
+        "Update metadata of one of the user's own watchlists (name, description, visibility, item-type lock, sort order). Only the fields you provide are changed. Does not need confirmation.",
+      inputSchema: z.object({
+        watchlistId: z
+          .number()
+          .describe("The numeric watchlist ID (from getMyWatchlists)"),
+        name: z.string().trim().min(1).optional().describe("New name"),
+        description: z
+          .string()
+          .nullable()
+          .optional()
+          .describe("New description, or null to clear it"),
+        isPublic: z.boolean().optional().describe("New visibility"),
+        allowedItemType: allowedItemTypeSchema
+          .nullable()
+          .optional()
+          .describe("New item-type lock, or null to remove the lock"),
+        defaultSortOrder: sortOrderSchema
+          .optional()
+          .describe("New default sort order"),
+      }),
+      execute: async ({
+        watchlistId,
+        name,
+        description,
+        isPublic,
+        allowedItemType,
+        defaultSortOrder,
+      }: {
+        watchlistId: number;
+        name?: string;
+        description?: string | null;
+        isPublic?: boolean;
+        allowedItemType?: "Movie" | "Series" | "Episode" | null;
+        defaultSortOrder?: "custom" | "name" | "dateAdded" | "releaseDate";
+      }) => {
+        const data: Parameters<typeof updateWatchlistDb>[0]["data"] = {};
+        if (name !== undefined) data.name = name.trim();
+        if (description !== undefined) data.description = description;
+        if (isPublic !== undefined) data.isPublic = isPublic;
+        if (allowedItemType !== undefined)
+          data.allowedItemType = allowedItemType;
+        if (defaultSortOrder !== undefined)
+          data.defaultSortOrder = defaultSortOrder;
+
+        if (Object.keys(data).length === 0) {
+          return { success: false, message: "No fields to update" };
+        }
+
+        const updated = await updateWatchlistDb({ watchlistId, userId, data });
+        if (!updated) {
+          return {
+            success: false,
+            message: "Watchlist not found or you do not own it",
+          };
+        }
+        return {
+          success: true,
+          watchlist: {
+            id: updated.id,
+            name: updated.name,
+            description: updated.description,
+            isPublic: updated.isPublic,
+            allowedItemType: updated.allowedItemType,
+            defaultSortOrder: updated.defaultSortOrder,
+          },
+          message: `Updated watchlist "${updated.name}"`,
+        };
+      },
+    }),
+
+    deleteWatchlist: tool({
+      description:
+        "Permanently delete one of the user's own watchlists and all of its items. This cannot be undone — state exactly which watchlist will be deleted and wait for the user to confirm before calling this.",
+      inputSchema: z.object({
+        watchlistId: z
+          .number()
+          .describe("The numeric watchlist ID (from getMyWatchlists)"),
+      }),
+      execute: async ({ watchlistId }: { watchlistId: number }) => {
+        const deleted = await deleteWatchlistDb({ watchlistId, userId });
+        return {
+          success: deleted,
+          message: deleted
+            ? "Watchlist deleted"
+            : "Watchlist not found or you do not own it",
+        };
+      },
+    }),
+
+    addItemToWatchlist: tool({
+      description:
+        "Add a library item to one of the user's own watchlists. Get a real item ID from a search or recommendation tool first — never invent IDs. Does not need confirmation.",
+      inputSchema: z.object({
+        watchlistId: z
+          .number()
+          .describe("The numeric watchlist ID (from getMyWatchlists)"),
+        itemId: z
+          .string()
+          .min(1)
+          .describe("The library item ID (from a search/recommendation tool)"),
+      }),
+      execute: async ({
+        watchlistId,
+        itemId,
+      }: {
+        watchlistId: number;
+        itemId: string;
+      }) => {
+        const trimmedItemId = itemId.trim();
+
+        const ownedLists = await getUserOwnWatchlists({ serverId, userId });
+        if (!ownedLists.some((l) => l.id === watchlistId)) {
+          return {
+            success: false,
+            message: "Watchlist not found or you do not own it",
+          };
+        }
+
+        const [libraryItem] = await db
+          .select({ id: items.id })
+          .from(items)
+          .where(and(eq(items.id, trimmedItemId), eq(items.serverId, serverId)))
+          .limit(1);
+        if (!libraryItem) {
+          return {
+            success: false,
+            message: "That item isn't in this server's library",
+          };
+        }
+
+        const result = await addItemToWatchlistDb({
+          watchlistId,
+          itemId: trimmedItemId,
+          userId,
+        });
+        if (!result) {
+          return {
+            success: false,
+            message:
+              "Could not add item — the watchlist may not exist, you may not own it, the item type may not be allowed by this list, the item isn't in the library, or it's already in the list.",
+          };
+        }
+        return { success: true, message: "Added item to watchlist" };
+      },
+    }),
+
+    removeItemFromWatchlist: tool({
+      description:
+        "Remove an item from one of the user's own watchlists. State which item and watchlist and wait for the user to confirm before calling this.",
+      inputSchema: z.object({
+        watchlistId: z
+          .number()
+          .describe("The numeric watchlist ID (from getMyWatchlists)"),
+        itemId: z
+          .string()
+          .min(1)
+          .describe(
+            "The library item ID to remove (from getWatchlistContents)",
+          ),
+      }),
+      execute: async ({
+        watchlistId,
+        itemId,
+      }: {
+        watchlistId: number;
+        itemId: string;
+      }) => {
+        const removed = await removeItemFromWatchlistDb({
+          watchlistId,
+          itemId: itemId.trim(),
+          userId,
+        });
+        return {
+          success: removed,
+          message: removed
+            ? "Removed item from watchlist"
+            : "Item not found in that watchlist or you do not own it",
+        };
+      },
+    }),
+
+    reorderWatchlistItems: tool({
+      description:
+        "Set the order of items in one of the user's own watchlists. Call getWatchlistContents first, then pass every current item ID exactly once in the desired order (position 0 first). Missing, extra, or duplicate IDs are rejected. Only affects lists sorted by 'custom' order. Does not need confirmation.",
+      inputSchema: z.object({
+        watchlistId: z
+          .number()
+          .describe("The numeric watchlist ID (from getMyWatchlists)"),
+        itemIds: z
+          .array(z.string().min(1))
+          .min(1)
+          .describe(
+            "Every current item ID exactly once, in the desired order (first position first)",
+          ),
+      }),
+      execute: async ({
+        watchlistId,
+        itemIds,
+      }: {
+        watchlistId: number;
+        itemIds: string[];
+      }) => {
+        const trimmed = itemIds.map((id) => id.trim());
+        const provided = new Set(trimmed);
+        if (provided.size !== trimmed.length) {
+          return {
+            success: false,
+            message: "The item ID list contains duplicates",
+          };
+        }
+
+        const list = await getWatchlistWithItems({ watchlistId, userId });
+        if (!list) {
+          return {
+            success: false,
+            message: "Watchlist not found or you do not own it",
+          };
+        }
+
+        const current = new Set(list.items.map((i) => i.item.id));
+        if (
+          provided.size !== current.size ||
+          [...current].some((id) => !provided.has(id))
+        ) {
+          return {
+            success: false,
+            message:
+              "Provide every current item ID exactly once — no missing, extra, or duplicate IDs. Call getWatchlistContents to get the current list.",
+          };
+        }
+
+        const reordered = await reorderWatchlistItemsDb({
+          watchlistId,
+          userId,
+          itemIds: trimmed,
+        });
+        return {
+          success: reordered,
+          message: reordered
+            ? "Reordered watchlist items"
+            : "Watchlist not found or you do not own it",
         };
       },
     }),
