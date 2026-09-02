@@ -1209,7 +1209,7 @@ export function createChatTools(serverId: number, userId: string) {
       description:
         "Create a new watchlist owned by the current user. Does not need confirmation. New watchlists cannot be promoted/featured from chat.",
       inputSchema: z.object({
-        name: z.string().min(1).describe("Watchlist name"),
+        name: z.string().trim().min(1).describe("Watchlist name"),
         description: z.string().optional().describe("Optional description"),
         isPublic: z
           .boolean()
@@ -1268,7 +1268,7 @@ export function createChatTools(serverId: number, userId: string) {
         watchlistId: z
           .number()
           .describe("The numeric watchlist ID (from getMyWatchlists)"),
-        name: z.string().min(1).optional().describe("New name"),
+        name: z.string().trim().min(1).optional().describe("New name"),
         description: z
           .string()
           .nullable()
@@ -1371,9 +1371,31 @@ export function createChatTools(serverId: number, userId: string) {
         watchlistId: number;
         itemId: string;
       }) => {
+        const trimmedItemId = itemId.trim();
+
+        const ownedLists = await getUserOwnWatchlists({ serverId, userId });
+        if (!ownedLists.some((l) => l.id === watchlistId)) {
+          return {
+            success: false,
+            message: "Watchlist not found or you do not own it",
+          };
+        }
+
+        const [libraryItem] = await db
+          .select({ id: items.id })
+          .from(items)
+          .where(and(eq(items.id, trimmedItemId), eq(items.serverId, serverId)))
+          .limit(1);
+        if (!libraryItem) {
+          return {
+            success: false,
+            message: "That item isn't in this server's library",
+          };
+        }
+
         const result = await addItemToWatchlistDb({
           watchlistId,
-          itemId: itemId.trim(),
+          itemId: trimmedItemId,
           userId,
         });
         if (!result) {
@@ -1424,7 +1446,7 @@ export function createChatTools(serverId: number, userId: string) {
 
     reorderWatchlistItems: tool({
       description:
-        "Set the order of items in one of the user's own watchlists. Call getWatchlistContents first to get the current item IDs, then pass the complete list of item IDs in the desired order (position 0 first). Any item IDs not included keep their existing position. Only affects lists sorted by 'custom' order. Does not need confirmation.",
+        "Set the order of items in one of the user's own watchlists. Call getWatchlistContents first, then pass every current item ID exactly once in the desired order (position 0 first). Missing, extra, or duplicate IDs are rejected. Only affects lists sorted by 'custom' order. Does not need confirmation.",
       inputSchema: z.object({
         watchlistId: z
           .number()
@@ -1432,7 +1454,9 @@ export function createChatTools(serverId: number, userId: string) {
         itemIds: z
           .array(z.string().min(1))
           .min(1)
-          .describe("All item IDs in the desired order, first position first"),
+          .describe(
+            "Every current item ID exactly once, in the desired order (first position first)",
+          ),
       }),
       execute: async ({
         watchlistId,
@@ -1441,10 +1465,39 @@ export function createChatTools(serverId: number, userId: string) {
         watchlistId: number;
         itemIds: string[];
       }) => {
+        const trimmed = itemIds.map((id) => id.trim());
+        const provided = new Set(trimmed);
+        if (provided.size !== trimmed.length) {
+          return {
+            success: false,
+            message: "The item ID list contains duplicates",
+          };
+        }
+
+        const list = await getWatchlistWithItems({ watchlistId, userId });
+        if (!list) {
+          return {
+            success: false,
+            message: "Watchlist not found or you do not own it",
+          };
+        }
+
+        const current = new Set(list.items.map((i) => i.item.id));
+        if (
+          provided.size !== current.size ||
+          [...current].some((id) => !provided.has(id))
+        ) {
+          return {
+            success: false,
+            message:
+              "Provide every current item ID exactly once — no missing, extra, or duplicate IDs. Call getWatchlistContents to get the current list.",
+          };
+        }
+
         const reordered = await reorderWatchlistItemsDb({
           watchlistId,
           userId,
-          itemIds: itemIds.map((id) => id.trim()),
+          itemIds: trimmed,
         });
         return {
           success: reordered,
